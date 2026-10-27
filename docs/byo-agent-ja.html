@@ -260,6 +260,7 @@
           <li><a href="#replace">既存 hosted を BYO に置き換える</a></li>
           <li><a href="#trouble">トラブルシューティング</a></li>
           <li><a href="#tailnet">Tailnet 内の別 PC から利用する</a></li>
+          <li><a href="#codex-oauth">Codex を ChatGPT OAuth（auth.json）で使う</a></li>
           <li><a href="#reboot">付録: PC 再起動後のチェックリスト</a></li>
           <li><a href="#refs">参考リンク</a></li>
         </ol>
@@ -616,6 +617,174 @@ onecli run --agent my-agent -- claude</code></pre>
           <code>&lt;onecli-host&gt;:10255</code> に到達でき、CA を信頼できるようにしてください。
         </li>
       </ul>
+
+      <h2 id="codex-oauth">6. Codex を ChatGPT OAuth（auth.json）で使う</h2>
+      <p>
+        API キー（<code>sk-...</code>）ではなく、ChatGPT のログイン（<code>~/.codex/auth.json</code>）で
+        Codex を動かす手順です。OneCLI は <code>auth.json</code> を <code>authMode: oauth</code> として
+        自動判定し、エージェントには <code>CODEX_HOME</code> とダミーの <code>auth.json</code> を渡します。
+        実際のトークンはゲートウェイが注入し、期限切れ時は refresh token で更新します。
+      </p>
+
+      <div class="callout warn">
+        <p>
+          <strong><code>auth.json</code> はパスワード同等です。</strong>
+          リポジトリやチャットに貼らず、パーミッションを <code>600</code> にしてください。
+        </p>
+      </div>
+
+      <h3>6.1 OAuth シークレットを作る</h3>
+      <p>Codex を ChatGPT でログイン済みの PC で:</p>
+      <pre><code>codex login
+ls -l ~/.codex/auth.json</code></pre>
+      <p>OneCLI に OAuth シークレットとして登録します。</p>
+      <pre><code>onecli secrets create \
+  --name "Codex OAuth" \
+  --type openai \
+  --file ~/.codex/auth.json \
+  --host-pattern api.openai.com</code></pre>
+      <ul>
+        <li>
+          サーバーが <code>auth_mode: "chatgpt"</code> と <code>tokens</code> を見て
+          <code>authMode: oauth</code> を自動判定します
+        </li>
+        <li><code>hostPattern</code> は内部的に <code>chatgpt.com</code> に正規化されます</li>
+        <li>返ってきた <code>id</code> を控えます</li>
+      </ul>
+
+      <h3>6.2 エージェントに付与し、API キーを外す</h3>
+      <pre><code>onecli agents grants attach-secret \
+  --id &lt;agent-id&gt; --secret-id &lt;oauth-secret-id&gt;
+
+onecli agents grants detach-secret \
+  --id &lt;agent-id&gt; --secret-id &lt;api-key-secret-id&gt;
+
+# 不要なら API キーのシークレットを削除
+onecli secrets delete --id &lt;api-key-secret-id&gt;</code></pre>
+      <p>確認:</p>
+      <pre><code>onecli agents credentials --id &lt;agent-id&gt;</code></pre>
+      <p>
+        OAuth のシークレットだけが表示され、<code>OPENAI_API_KEY</code> が注入されなければ OK です。
+      </p>
+      <pre><code>onecli run --agent codex --dry-run -- codex</code></pre>
+      <p><code>CODEX_HOME</code> が出て、<code>OPENAI_API_KEY</code> が出ないことを確認します。</p>
+
+      <h3>6.3 クライアントの auth.json を OneCLI 管理用に置き換える</h3>
+      <p>
+        OneCLI の CLI は <code>~/.codex/auth.json</code> が存在しない場合だけスタブを作ります。
+        既存ファイルは上書きしません。ChatGPT ログイン直後の本物の <code>auth.json</code> がある場合は、
+        <strong>id_token と account_id を残し、access/refresh だけ</strong>を OneCLI 管理用に
+        差し替えます。
+      </p>
+      <pre><code>cp ~/.codex/auth.json ~/.codex/auth.json.real
+
+jq --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  '.OPENAI_API_KEY = null
+   | .tokens.access_token = "onecli-managed"
+   | .tokens.refresh_token = "onecli-managed"
+   | .last_refresh = $now' \
+  ~/.codex/auth.json.real &gt; /tmp/codex-auth.json
+
+mv /tmp/codex-auth.json ~/.codex/auth.json
+chmod 600 ~/.codex/auth.json</code></pre>
+      <p>置き換え後のイメージ:</p>
+      <pre><code>{
+  "auth_mode": "chatgpt",
+  "OPENAI_API_KEY": null,
+  "tokens": {
+    "id_token": "&lt;real-id-token&gt;",
+    "access_token": "onecli-managed",
+    "refresh_token": "onecli-managed",
+    "account_id": "&lt;account-id&gt;"
+  },
+  "last_refresh": "&lt;ISO8601&gt;"
+}</code></pre>
+      <div class="callout warn">
+        <p>
+          <code>id_token</code> と <code>account_id</code> は、OneCLI に登録した
+          <code>auth.json</code> と同じアカウントの値でなければなりません。別アカウントの値を作ると
+          <code>selected workspace missing from routing discovery</code> の原因になります。
+        </p>
+      </div>
+
+      <h3>6.4 macOS で Keychain が優先される場合</h3>
+      <p>
+        Codex は macOS の Keychain に認証を保存し、<code>~/.codex/auth.json</code> より優先することが
+        あります。その場合、ファイルを直しても古いアカウントが使われます。
+      </p>
+      <pre><code>cat ~/.codex/config.toml
+security find-generic-password -s "Codex Auth" 2&gt;&amp;1 | head -5</code></pre>
+      <p>
+        <code>cli_auth_credentials_store</code> が <code>auto</code> / <code>keyring</code> なら、
+        ファイル保存に固定します。
+      </p>
+      <pre><code># 既存行を置き換える
+sed -i '' 's/^cli_auth_credentials_store *=.*/cli_auth_credentials_store = "file"/' \
+  ~/.codex/config.toml
+
+# 行がない場合
+grep -q '^cli_auth_credentials_store' ~/.codex/config.toml 2&gt;/dev/null || \
+  printf '\ncli_auth_credentials_store = "file"\n' &gt;&gt; ~/.codex/config.toml</code></pre>
+      <p>Keychain の古い項目が残っている場合は削除します。</p>
+      <pre><code>security delete-generic-password -s "Codex Auth"</code></pre>
+
+      <h3>6.5 Codex のプロセスをすべて終了する</h3>
+      <p>
+        古い app-server が認証をメモリに持っていると、ファイルを直しても反映されません。
+        IDE の Codex 拡張も終了します。
+      </p>
+      <pre><code>pgrep -fl codex
+pkill -f 'codex'</code></pre>
+
+      <h3>6.6 OAuth で起動する</h3>
+      <pre><code>onecli run --agent codex -- codex</code></pre>
+      <p>確認ポイント:</p>
+      <ul>
+        <li>起動時に <code>OPENAI_API_KEY</code> ではなく <code>CODEX_HOME</code> が使われる</li>
+        <li>
+          ゲートウェイのログに <code>chatgpt.com/backend-api/wham/accounts/check</code> への 200 と
+          <code>injections_applied</code> が出る
+        </li>
+        <li><code>api.openai.com/v1/responses</code> への 401 が出ない</li>
+      </ul>
+
+      <h3>6.7 selected workspace missing from routing discovery</h3>
+      <p>
+        このエラーは、Codex がローカルの <code>auth.json</code> から読んだ <code>account_id</code> を、
+        ChatGPT のアカウント一覧で見つけられないときに発生します。
+      </p>
+      <pre><code>jq '{auth_mode, account_id: .tokens.account_id, access: .tokens.access_token}' \
+  ~/.codex/auth.json</code></pre>
+      <p>
+        <code>account_id</code> が OneCLI の OAuth シークレットの <code>metadata.accountId</code> と
+        一致しているか確認します。一致していても直らない場合は、次を順に確認してください。
+      </p>
+      <ol>
+        <li><code>~/.codex/config.toml</code> の <code>cli_auth_credentials_store</code> が <code>"file"</code> になっているか</li>
+        <li>Keychain（<code>Codex Auth</code>）に古い認証が残っていないか</li>
+        <li>Codex のプロセスをすべて終了したか</li>
+        <li><code>~/.codex/auth.json</code> の <code>id_token</code> と <code>account_id</code> が同じアカウントか</li>
+        <li>OneCLI のシークレットが、その <code>auth.json</code> から作られているか</li>
+      </ol>
+
+      <h3>6.8 API キー方式を完全に止める</h3>
+      <pre><code>onecli agents credentials --id &lt;agent-id&gt;
+onecli secrets list</code></pre>
+      <ul>
+        <li>OAuth 以外の <code>openai</code> シークレットがエージェントに付いていないこと</li>
+        <li>
+          シェルに <code>OPENAI_API_KEY</code> が残っていないこと
+          （<code>~/.zshrc</code> / <code>~/.bashrc</code> も確認）
+        </li>
+        <li><code>~/.codex/config.toml</code> に API キーを強制する設定がないこと</li>
+      </ul>
+      <pre><code>unset OPENAI_API_KEY</code></pre>
+      <div class="callout">
+        <p>
+          ChatGPT の OAuth を使う場合、API プラットフォームの API キーは不要です。API キーの
+          シークレットを削除すれば、誤って API キー方式に戻ることはありません。
+        </p>
+      </div>
 
       <h2 id="reboot">付録: PC 再起動後のチェックリスト</h2>
       <p>

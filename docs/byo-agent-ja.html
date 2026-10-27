@@ -259,6 +259,7 @@
           <li><a href="#create">新規 BYO エージェントの発行</a></li>
           <li><a href="#replace">既存 hosted を BYO に置き換える</a></li>
           <li><a href="#trouble">トラブルシューティング</a></li>
+          <li><a href="#tailnet">Tailnet 内の別 PC から利用する</a></li>
           <li><a href="#reboot">付録: PC 再起動後のチェックリスト</a></li>
           <li><a href="#refs">参考リンク</a></li>
         </ol>
@@ -493,6 +494,128 @@ onecli run --dry-run -- claude</code></pre>
           </tr>
         </tbody>
       </table>
+
+      <h2 id="tailnet">5. Tailnet 内の別 PC から利用する</h2>
+      <p>
+        OneCLI をホストしている PC 以外のマシンからも、同じ tailnet 経由でエージェントを実行できます。
+        エージェント本体は<strong>利用する PC 側</strong>で動き、設定の取得は API、外部通信はゲートウェイを
+        経由します。ホスト側に runner や追加の Docker コンテナは要りません。
+      </p>
+      <table>
+        <thead>
+          <tr>
+            <th>用途</th>
+            <th>接続先</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>API（エージェント設定の取得・管理）</td>
+            <td><code>http://&lt;onecli-host&gt;:10256</code></td>
+          </tr>
+          <tr>
+            <td>ゲートウェイ（エージェントの proxy）</td>
+            <td><code>&lt;onecli-host&gt;:10255</code></td>
+          </tr>
+          <tr>
+            <td>Dashboard（任意）</td>
+            <td><code>http://&lt;onecli-host&gt;:10254</code></td>
+          </tr>
+        </tbody>
+      </table>
+      <p>
+        <code>&lt;onecli-host&gt;</code> は OneCLI ホストの tailnet 上の IP または MagicDNS 名に
+        置き換えてください。IP は変わることがあるため、可能なら MagicDNS 名の利用をおすすめします。
+      </p>
+
+      <h3>CLI を使う（推奨）</h3>
+      <ol>
+        <li>
+          OneCLI ホスト側で API キーを確認します（他人に見せないでください）。
+          <pre><code>onecli auth api-key</code></pre>
+        </li>
+        <li>
+          別 PC に CLI をインストールします。
+          <pre><code>curl -fsSL onecli.sh/cli/install | sh</code></pre>
+        </li>
+        <li>
+          API の向き先を OneCLI ホストに変更します。
+          <pre><code>onecli config set api-host http://&lt;onecli-host&gt;:10256
+
+# 環境変数で指定する場合
+export ONECLI_API_HOST=http://&lt;onecli-host&gt;:10256</code></pre>
+        </li>
+        <li>
+          API キーでログインします。
+          <pre><code>onecli auth login --api-key oc_...</code></pre>
+        </li>
+        <li>
+          エージェントを確認して実行します。
+          <pre><code>onecli agents list
+onecli config set agent my-agent
+onecli run --agent my-agent -- claude</code></pre>
+        </li>
+      </ol>
+      <p>
+        サーバーが返す proxy アドレスは <code>host.docker.internal:10255</code> ですが、
+        CLI が API ホスト名に自動で書き換えるため、別 PC 側で proxy を設定する必要はありません。
+      </p>
+
+      <h3>API を直接使う</h3>
+      <pre><code>curl -s "http://&lt;onecli-host&gt;:10256/v1/container-config?agent=my-agent" \
+  -H "Authorization: Bearer $ONECLI_API_KEY" \
+  -H "X-Project-Id: &lt;project-id&gt;" | jq .</code></pre>
+      <ul>
+        <li>
+          レスポンスの <code>env.HTTPS_PROXY</code> にはエージェントの proxy トークンが含まれます。
+          トークンはログや画面に出さないでください。
+        </li>
+        <li>
+          API を直接使う場合、<code>host.docker.internal</code> は別 PC では解決できません。
+          <code>env.HTTPS_PROXY</code> のホスト部分を <code>&lt;onecli-host&gt;</code> に置換してください
+          （CLI は自動で行います）。
+        </li>
+        <li>
+          TLS を検証する場合は、レスポンスの <code>caCertificate</code> を信頼ストアに追加します。
+        </li>
+        <li>
+          プロジェクトを明示する場合は <code>X-Project-Id</code> に
+          <code>onecli projects list</code> の <code>id</code> を指定します。
+        </li>
+      </ul>
+
+      <div class="callout warn">
+        <p>
+          <strong>Dashboard を別 PC から使う場合</strong>は、<code>ONECLI_EXTERNAL_URL</code>
+          （または <code>ONECLI_TRUSTED_ORIGINS</code>）にダッシュボードの URL を設定する必要があります。
+          未設定のままだと、better-auth は localhost 以外の origin からのログインを拒否します。
+          CLI と API キーによる利用はこの制限を受けません。
+        </p>
+      </div>
+
+      <div class="callout warn">
+        <p>
+          <strong>公開範囲に注意してください。</strong>
+          セルフホストは既定で <code>0.0.0.0</code> で待ち受けるため、tailnet だけでなく LAN からも
+          到達できます。tailnet に限定するなら Tailscale ACL や <code>ufw</code> で
+          10254〜10257 番を <code>tailscale0</code> のみ許可し、インターネットには公開しないでください。
+        </p>
+      </div>
+
+      <ul>
+        <li>
+          API キーはユーザーの資格情報です。別の人に利用させる場合は、その人専用のユーザーと
+          API キーを作成してください。
+        </li>
+        <li>
+          エージェントからモデルへの通信は、OneCLI ホストのゲートウェイを経由します。
+          別 PC からモデルへ直接到達できる必要はありません（ホスト側から到達できる必要はあります）。
+        </li>
+        <li>
+          別 PC のコンテナ内でエージェントを動かす場合は、そのコンテナから
+          <code>&lt;onecli-host&gt;:10255</code> に到達でき、CA を信頼できるようにしてください。
+        </li>
+      </ul>
 
       <h2 id="reboot">付録: PC 再起動後のチェックリスト</h2>
       <p>
